@@ -15,10 +15,15 @@ limitations under the License.
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/external-secrets/external-secrets/pkg/constants"
+	"github.com/external-secrets/external-secrets/pkg/metrics"
+	"net/http"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"strconv"
 	"time"
 
@@ -114,9 +119,84 @@ func (w *WebHook) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRe
 	return false, errors.New(errNotImplemented)
 }
 
-// PushSecret not implement.
-func (w *WebHook) PushSecret(_ context.Context, _ *corev1.Secret, _ esv1beta1.PushSecretData) error {
-	return errors.New(errNotImplemented)
+func (w *WebHook) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1beta1.PushSecretData) error {
+	if data.GetProperty() == "" && data.GetSecretKey() != "" {
+		return errors.New("requires property in RemoteRef to push secret value if secret key is defined")
+	}
+	provider, err := getProvider(w.store)
+	if err != nil {
+		return fmt.Errorf("failed to get store: %w", err)
+	}
+
+	method := provider.Method
+	if method == "" {
+		method = http.MethodPost
+	}
+
+	//ref := esv1beta1.ExternalSecretDataRemoteRef{Key: data.GetRemoteKey(), Property: data.GetProperty()}
+	//templateData, err := w.wh.GetTemplateData(ctx, &ref, provider.Secrets, false)
+
+	var value []byte
+	if data.GetSecretKey() == "" {
+		// Must convert secret values to string, otherwise data will be sent as base64 to Vault
+
+		/*
+			secretStringVal := make(map[string]string)
+			for k, v := range secret.Data {
+
+				templateString, err := webhook.ExecuteTemplateString(string(v), templateData)
+				if err != nil {
+					return err
+				}
+
+				secretStringVal[k] = templateString
+			}
+
+			ctrl.Log.Info("data------------------", "template data", templateData)
+			ctrl.Log.Info("wat------------------", "secret data", secret.Data)
+			ctrl.Log.Info("hmmmmmmmmmmmmmmmmmmmmmmmmmmmm------------------", "templated data", secretStringVal)
+
+		*/
+
+		value, err = utils.JSONMarshal(secret.Data)
+		if err != nil {
+			return fmt.Errorf("failed to serialize secret content as JSON: %w", err)
+		}
+	} else {
+		value = secret.Data[data.GetSecretKey()]
+	}
+
+	ctrl.Log.Info("wat------------------", "secret data", string(value))
+
+	req, err := http.NewRequestWithContext(ctx, method, provider.URL, bytes.NewBuffer(value))
+	if err != nil {
+		return fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	for k, v := range provider.Headers {
+		req.Header.Add(k, v)
+	}
+
+	resp, err := w.wh.HTTP.Do(req)
+	metrics.ObserveAPICall(constants.ProviderWebhook, constants.CallWebhookHTTPReq, err)
+	if err != nil {
+		return fmt.Errorf("failed to call endpoint: %w", err)
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return esv1beta1.NoSecretError{}
+	}
+
+	if resp.StatusCode == http.StatusNotModified {
+		return esv1beta1.NotModifiedError{}
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("endpoint gave error %s", resp.Status)
+	}
+
+	return nil
 }
 
 // GetAllSecrets Empty .
